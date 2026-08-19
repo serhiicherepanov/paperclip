@@ -89,6 +89,16 @@ const {
   };
   const environmentCustomImagesServiceFactoryMock = vi.fn(() => environmentCustomImagesServiceMock);
   const executionWorkspaceServiceMock = {
+    scheduleCleanupEligibility: vi.fn(async () => ({
+      checked: 0,
+      scheduled: 0,
+      clearedIneligible: 0,
+      skippedNoPolicy: 0,
+      skippedProjectPrimary: 0,
+      skippedScope: 0,
+      skippedNotReady: 0,
+      skippedAlreadyScheduled: 0,
+    })),
     sweepTerminalWorkspaces: vi.fn(async () => ({
       checked: 0,
       eligible: 0,
@@ -98,6 +108,9 @@ const {
       skippedNonTerminalTree: 0,
       skippedUndelivered: 0,
       skippedRace: 0,
+      skippedCooldown: 0,
+      skippedRetentionPending: 0,
+      retentionCandidates: 0,
     })),
   };
   const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
@@ -493,15 +506,53 @@ describe("startServer feedback export wiring", () => {
 
       expect(intervalCallback).not.toBeNull();
       intervalCallback?.();
-      await Promise.resolve();
-      await Promise.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(issueThreadInteractionServiceMock.sweepMergedPullRequestConfirmations).toHaveBeenCalledTimes(1);
-      expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => {
+        expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
+      });
       expect(routineServiceMock.tickScheduledTriggers).toHaveBeenCalledTimes(1);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(2);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("runs terminal workspace sweep when retention scheduling fails", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    resolveHeartbeatSchedulingSuppressionMock.mockReturnValue({
+      suppressed: true,
+      reason: "worktree_instance",
+    });
+    executionWorkspaceServiceMock.scheduleCleanupEligibility.mockRejectedValueOnce(
+      new Error("retention scheduler unavailable"),
+    );
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      await vi.waitFor(() => {
+        expect(executionWorkspaceServiceMock.scheduleCleanupEligibility).toHaveBeenCalledTimes(1);
+        expect(executionWorkspaceServiceMock.sweepTerminalWorkspaces).toHaveBeenCalledTimes(1);
+      });
     } finally {
       setIntervalSpy.mockRestore();
     }

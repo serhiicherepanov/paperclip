@@ -5,8 +5,11 @@ import type {
   ProjectExecutionWorkspaceDefaultMode,
   ProjectExecutionWorkspacePolicy,
   SharedWorkspaceConcurrency,
+  WorkspaceCleanupPolicy,
 } from "@paperclipai/shared";
+import { workspaceCleanupPolicySchema } from "@paperclipai/shared";
 import { asString, parseObject } from "../adapters/utils.js";
+import { logger } from "../middleware/logger.js";
 
 export type ParsedExecutionWorkspaceMode = Exclude<ExecutionWorkspaceMode, "inherit" | "reuse_existing">;
 
@@ -101,7 +104,45 @@ export function isUnrunnableWorktreeCombo(input: {
   return input.hasResolvablePriorSessionWorkspace !== true;
 }
 
-export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecutionWorkspacePolicy | null {
+const invalidCleanupPolicyWarnedProjectIds = new Set<string>();
+
+export type RetentionWorkspaceScopeInput = {
+  mode: string;
+};
+
+/** Whether an enabled retention policy applies to this workspace (scope + project-primary gate). */
+export function retentionAppliesToWorkspace(
+  cleanupPolicy: WorkspaceCleanupPolicy,
+  workspace: RetentionWorkspaceScopeInput,
+  options: { isProjectPrimary: boolean },
+): boolean {
+  if (cleanupPolicy.excludeProjectPrimary && options.isProjectPrimary) return false;
+  if (cleanupPolicy.scope === "isolated_workspace" && workspace.mode !== "isolated_workspace") return false;
+  return true;
+}
+
+export function parseWorkspaceCleanupPolicy(
+  raw: unknown,
+  options: { projectId?: string | null } = {},
+): WorkspaceCleanupPolicy | null {
+  if (raw === null || raw === undefined) return null;
+  const result = workspaceCleanupPolicySchema.safeParse(raw);
+  if (result.success) return result.data;
+  const projectId = options.projectId ?? null;
+  if (projectId && !invalidCleanupPolicyWarnedProjectIds.has(projectId)) {
+    invalidCleanupPolicyWarnedProjectIds.add(projectId);
+    logger.warn(
+      { event: "execution_workspace.retention_policy_invalid", projectId },
+      "ignored invalid execution workspace cleanup policy",
+    );
+  }
+  return null;
+}
+
+export function parseProjectExecutionWorkspacePolicy(
+  raw: unknown,
+  options: { projectId?: string | null } = {},
+): ProjectExecutionWorkspacePolicy | null {
   const parsed = parseObject(raw);
   if (Object.keys(parsed).length === 0) return null;
   const enabled = typeof parsed.enabled === "boolean" ? parsed.enabled : false;
@@ -112,6 +153,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
   const allowIssueOverride =
     typeof parsed.allowIssueOverride === "boolean" ? parsed.allowIssueOverride : undefined;
   const sharedWorkspaceConcurrency = parseSharedWorkspaceConcurrency(parsed.sharedWorkspaceConcurrency);
+  const cleanupPolicy = parseWorkspaceCleanupPolicy(parsed.cleanupPolicy, options);
   const normalizedDefaultMode = (() => {
     if (
       defaultMode === "shared_workspace" ||
@@ -144,9 +186,7 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
     ...(parsed.runtimePolicy && typeof parsed.runtimePolicy === "object" && !Array.isArray(parsed.runtimePolicy)
       ? { runtimePolicy: { ...(parsed.runtimePolicy as Record<string, unknown>) } }
       : {}),
-    ...(parsed.cleanupPolicy && typeof parsed.cleanupPolicy === "object" && !Array.isArray(parsed.cleanupPolicy)
-      ? { cleanupPolicy: { ...(parsed.cleanupPolicy as Record<string, unknown>) } }
-      : {}),
+    ...(cleanupPolicy ? { cleanupPolicy } : {}),
     ...(parsed.authorizationPolicy && typeof parsed.authorizationPolicy === "object" && !Array.isArray(parsed.authorizationPolicy)
       ? { authorizationPolicy: { ...(parsed.authorizationPolicy as Record<string, unknown>) } }
       : {}),

@@ -46,7 +46,11 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
-import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
+import {
+  parseProjectExecutionWorkspacePolicy,
+  parseWorkspaceCleanupPolicy,
+  retentionAppliesToWorkspace,
+} from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { logActivity } from "./activity-log.js";
@@ -172,6 +176,16 @@ export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingCon
 // same write that sets the flag, and every clear removes both keys together.
 export const EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY = "reopenPendingConsumptionSince";
 
+// Records the cleanupEligibleAt value for which a retention_candidate activity
+// log was emitted. The terminal reaper compares this to the current
+// cleanupEligibleAt so report_only candidates log once per eligibility anchor.
+export const EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY =
+  "retentionCandidateLoggedForEligibleAt";
+
+// Cached du estimate written alongside the retention_candidate log marker.
+export const EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY =
+  "retentionCandidateEstimatedBytes";
+
 export function metadataHasReopenPendingConsumption(
   metadata: Record<string, unknown> | null | undefined,
 ): boolean {
@@ -213,6 +227,43 @@ export function clearMetadataReopenPendingConsumption(
   const next = { ...(metadata ?? {}) };
   delete next[EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY];
   delete next[EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY];
+  return next;
+}
+
+function readRetentionCandidateLoggedForEligibleAt(
+  metadata: Record<string, unknown> | null | undefined,
+): string | null {
+  const raw = metadata?.[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY];
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+function readRetentionCandidateEstimatedBytes(
+  metadata: Record<string, unknown> | null | undefined,
+): number | null {
+  const raw = metadata?.[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+}
+
+function buildRetentionCandidateLoggedMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  eligibleAt: Date,
+  estimatedBytes: number | null,
+): Record<string, unknown> {
+  return {
+    ...(metadata ?? {}),
+    [EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY]: eligibleAt.toISOString(),
+    ...(estimatedBytes != null
+      ? { [EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY]: estimatedBytes }
+      : {}),
+  };
+}
+
+function clearRetentionCandidateLoggedMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const next = { ...(metadata ?? {}) };
+  delete next[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY];
+  delete next[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY];
   return next;
 }
 
@@ -1307,6 +1358,173 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // removes the upper bound and makes the scan chase newer churn again. This
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
+  let retentionScheduleCursor: { updatedAt: Date; id: string } | null = null;
+  let retentionScheduleBoundary: Date | null = null;
+  let retentionScheduleInProgress = false;
+
+  async function loadProjectExecutionWorkspacePolicyForProject(
+    projectId: string | null,
+    companyId: string,
+    cache: Map<string, ReturnType<typeof parseProjectExecutionWorkspacePolicy>>,
+  ) {
+    if (!projectId) return null;
+    const cached = cache.get(projectId);
+    if (cached !== undefined) return cached;
+    const row = await db
+      .select({ executionWorkspacePolicy: projects.executionWorkspacePolicy })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    const policy = parseProjectExecutionWorkspacePolicy(row?.executionWorkspacePolicy, { projectId });
+    cache.set(projectId, policy);
+    return policy;
+  }
+
+  async function resolveWorkspaceIsProjectPrimary(
+    workspace: Pick<ExecutionWorkspaceRow, "companyId" | "projectId" | "projectWorkspaceId" | "providerRef" | "cwd">,
+  ) {
+    const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+    const resolvedWorkspacePath = workspacePath ? path.resolve(workspacePath) : null;
+    if (!workspace.projectWorkspaceId || !workspace.projectId || !resolvedWorkspacePath) return false;
+
+    const [projectWorkspace, primaryProjectWorkspace] = await Promise.all([
+      db
+        .select({ id: projectWorkspaces.id, cwd: projectWorkspaces.cwd })
+        .from(projectWorkspaces)
+        .where(and(
+          eq(projectWorkspaces.companyId, workspace.companyId),
+          eq(projectWorkspaces.id, workspace.projectWorkspaceId),
+        ))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: projectWorkspaces.id })
+        .from(projectWorkspaces)
+        .where(and(
+          eq(projectWorkspaces.companyId, workspace.companyId),
+          eq(projectWorkspaces.projectId, workspace.projectId),
+          eq(projectWorkspaces.isPrimary, true),
+        ))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    return resolveIsProjectPrimaryWorkspace({
+      projectWorkspaceId: workspace.projectWorkspaceId,
+      primaryProjectWorkspaceId: primaryProjectWorkspace?.id ?? null,
+      workspacePath: resolvedWorkspacePath,
+      projectWorkspacePath: projectWorkspace?.cwd ? path.resolve(projectWorkspace.cwd) : null,
+    });
+  }
+
+  async function estimateWorkspaceBytes(workspacePath: string | null): Promise<number | null> {
+    if (!workspacePath) return null;
+    try {
+      // GNU coreutils `du -sx --bytes`; busybox/macOS builds may not support
+      // these flags and will return null instead of failing the sweep.
+      const { stdout } = await execFileAsync("du", ["-sx", "--bytes", workspacePath], {
+        timeout: 2_000,
+        maxBuffer: 1024 * 1024,
+      });
+      const match = stdout.trim().match(/^(\d+)/);
+      return match ? Number(match[1]) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function clearScheduledCleanupEligibleAt(workspaceId: string): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      await acquireExecutionWorkspaceLifecycleLock(tx, workspaceId);
+      const existing = await tx
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0] ?? null);
+      const rows = await tx
+        .update(executionWorkspaces)
+        .set({
+          cleanupEligibleAt: null,
+          metadata: clearRetentionCandidateLoggedMetadata(
+            existing?.metadata as Record<string, unknown> | null,
+          ),
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(executionWorkspaces.id, workspaceId),
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+          sql<boolean>`${executionWorkspaces.cleanupEligibleAt} IS NOT NULL`,
+        ))
+        .returning({ id: executionWorkspaces.id });
+      return rows.length > 0;
+    });
+  }
+
+  async function scheduleCleanupEligibleAtForWorkspace(
+    workspace: ExecutionWorkspaceRow,
+    computedEligibleAt: Date,
+  ): Promise<{ scheduled: boolean; alreadyScheduled: boolean }> {
+    const current = workspace.cleanupEligibleAt;
+    if (
+      current
+      && Math.abs(current.getTime() - computedEligibleAt.getTime()) <= 60_000
+    ) {
+      return { scheduled: false, alreadyScheduled: true };
+    }
+
+    const scheduled = await db.transaction(async (tx) => {
+      await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+      const rows = await tx
+        .update(executionWorkspaces)
+        .set({ cleanupEligibleAt: computedEligibleAt, updatedAt: new Date() })
+        .where(and(
+          eq(executionWorkspaces.id, workspace.id),
+          eq(executionWorkspaces.companyId, workspace.companyId),
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+        ))
+        .returning({
+          id: executionWorkspaces.id,
+          cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+          sourceIssueId: executionWorkspaces.sourceIssueId,
+        });
+      return rows[0] ?? null;
+    });
+
+    if (!scheduled) return { scheduled: false, alreadyScheduled: false };
+    return { scheduled: true, alreadyScheduled: false };
+  }
+
+  type RetentionReadinessAssessment = Awaited<ReturnType<typeof assessDelivery>> & {
+    statusInspectionSucceeded: boolean;
+  };
+
+  async function evaluateRetentionReadiness(
+    workspace: ExecutionWorkspaceRow,
+    options: { requireGitCloseReadiness?: boolean } = {},
+  ): Promise<RetentionReadinessAssessment | null> {
+    const requireGitCloseReadiness = options.requireGitCloseReadiness ?? true;
+    const executionWorkspace = toExecutionWorkspace(workspace);
+    const inspection = await inspectGitCloseReadiness(executionWorkspace);
+    const statusInspectionSucceeded = inspection.statusInspectionSucceeded;
+    if (requireGitCloseReadiness && !statusInspectionSucceeded) return null;
+    const git = inspection.git;
+    const assessment = await assessDelivery(workspace, git);
+    const reopenPending = metadataHasReopenPendingConsumption(
+      workspace.metadata as Record<string, unknown> | null,
+    );
+    if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) return null;
+    if (requireGitCloseReadiness && assessment.workspaceDirty) return null;
+    if (
+      assessment.deliveryState !== "merged_via_pr"
+      && assessment.deliveryState !== "merged_by_ancestry"
+    ) {
+      return null;
+    }
+    if (!assessment.cooldownAnchor) return null;
+    if (reopenPending) return null;
+    if (await workspaceHasActiveRun(workspace)) return null;
+    return { ...assessment, statusInspectionSucceeded };
+  }
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -2697,6 +2915,157 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       };
     },
 
+    scheduleCleanupEligibility: async (limit = 50) => {
+      if (retentionScheduleInProgress) {
+        return {
+          checked: 0,
+          scheduled: 0,
+          clearedIneligible: 0,
+          skippedNoPolicy: 0,
+          skippedProjectPrimary: 0,
+          skippedScope: 0,
+          skippedNotReady: 0,
+          skippedAlreadyScheduled: 0,
+        };
+      }
+      retentionScheduleInProgress = true;
+      try {
+        const baseCandidateFilter = and(
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+          sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+        );
+        const cursor = retentionScheduleCursor;
+        if (!cursor) {
+          retentionScheduleBoundary = now();
+        }
+        const boundary = retentionScheduleBoundary;
+        const boundaryFilter = boundary
+          ? lte(executionWorkspaces.updatedAt, boundary)
+          : undefined;
+        const cursorFilter = cursor
+          ? or(
+              gt(executionWorkspaces.updatedAt, cursor.updatedAt),
+              and(
+                eq(executionWorkspaces.updatedAt, cursor.updatedAt),
+                gt(executionWorkspaces.id, cursor.id),
+              ),
+            )
+          : undefined;
+        const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
+        const candidates = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(scanFilter)
+          .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+          .limit(limit);
+        if (candidates.length < limit) {
+          retentionScheduleCursor = null;
+          retentionScheduleBoundary = null;
+        } else {
+          const lastCandidate = candidates[candidates.length - 1]!;
+          retentionScheduleCursor = { updatedAt: lastCandidate.updatedAt, id: lastCandidate.id };
+        }
+
+        const result = {
+          checked: candidates.length,
+          scheduled: 0,
+          clearedIneligible: 0,
+          skippedNoPolicy: 0,
+          skippedProjectPrimary: 0,
+          skippedScope: 0,
+          skippedNotReady: 0,
+          skippedAlreadyScheduled: 0,
+        };
+        const projectPolicyCache = new Map<string, ReturnType<typeof parseProjectExecutionWorkspacePolicy>>();
+
+        for (const workspace of candidates) {
+          const projectPolicy = await loadProjectExecutionWorkspacePolicyForProject(
+            workspace.projectId,
+            workspace.companyId,
+            projectPolicyCache,
+          );
+          const cleanupPolicy = projectPolicy?.cleanupPolicy ?? null;
+          if (!cleanupPolicy?.enabled) {
+            result.skippedNoPolicy += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
+            continue;
+          }
+
+          const isProjectPrimary = cleanupPolicy.excludeProjectPrimary
+            ? await resolveWorkspaceIsProjectPrimary(workspace)
+            : false;
+          if (!retentionAppliesToWorkspace(cleanupPolicy, workspace, { isProjectPrimary })) {
+            if (isProjectPrimary) {
+              result.skippedProjectPrimary += 1;
+            } else {
+              result.skippedScope += 1;
+            }
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
+            continue;
+          }
+
+          const readiness = await evaluateRetentionReadiness(workspace, {
+            requireGitCloseReadiness: cleanupPolicy.requireCloseReadiness,
+          });
+
+          if (!readiness) {
+            result.skippedNotReady += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
+            continue;
+          }
+
+          const anchor = readiness.cooldownAnchor;
+          if (!anchor) {
+            result.skippedNotReady += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
+            continue;
+          }
+          const computedEligibleAt = new Date(
+            anchor.getTime() + cleanupPolicy.retentionDays * 86_400_000,
+          );
+          const writeResult = await scheduleCleanupEligibleAtForWorkspace(workspace, computedEligibleAt);
+          if (writeResult.alreadyScheduled) {
+            result.skippedAlreadyScheduled += 1;
+          } else if (writeResult.scheduled) {
+            result.scheduled += 1;
+            if (workspace.cleanupEligibleAt == null) {
+              await logActivity(db, {
+                companyId: workspace.companyId,
+                actorType: "system",
+                actorId: "workspace_retention_scheduler",
+                action: "execution_workspace.retention_scheduled",
+                entityType: "execution_workspace",
+                entityId: workspace.id,
+                details: {
+                  sourceIssueId: workspace.sourceIssueId,
+                  cleanupEligibleAt: computedEligibleAt.toISOString(),
+                  retentionDays: cleanupPolicy.retentionDays,
+                  mode: cleanupPolicy.mode,
+                },
+              });
+            }
+          }
+        }
+
+        return result;
+      } finally {
+        retentionScheduleInProgress = false;
+      }
+    },
+
     sweepTerminalWorkspaces: async (limit = 50) => {
       // Skip this sweep while another sweep runs. A concurrent sweep would share
       // the cursor and the boundary and could corrupt the rotation state. A
@@ -2713,6 +3082,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedRace: 0,
           skippedReopened: 0,
           skippedCooldown: 0,
+          skippedRetentionPending: 0,
+          retentionCandidates: 0,
+          retentionCandidateEstimatedBytesTotal: 0,
           clearedStaleReopenPending: 0,
         };
       }
@@ -2777,8 +3149,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedRace: 0,
         skippedReopened: 0,
         skippedCooldown: 0,
+        skippedRetentionPending: 0,
+        retentionCandidates: 0,
+        retentionCandidateEstimatedBytesTotal: 0,
         clearedStaleReopenPending: 0,
       };
+      const projectPolicyCache = new Map<string, ReturnType<typeof parseProjectExecutionWorkspacePolicy>>();
+      const retentionCandidateSummaryByCompany = new Map<string, { count: number; estimatedBytesTotal: number }>();
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
@@ -2894,6 +3271,97 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedActiveRun += 1;
           continue;
         }
+
+        const projectPolicy = await loadProjectExecutionWorkspacePolicyForProject(
+          workspace.projectId,
+          workspace.companyId,
+          projectPolicyCache,
+        );
+        const cleanupPolicy = projectPolicy?.cleanupPolicy ?? null;
+        if (
+          cleanupPolicy?.enabled
+          && retentionAppliesToWorkspace(cleanupPolicy, workspace, {
+            isProjectPrimary: cleanupPolicy.excludeProjectPrimary
+              ? await resolveWorkspaceIsProjectPrimary(workspace)
+              : false,
+          })
+        ) {
+          const eligibleAt = workspace.cleanupEligibleAt;
+          if (!eligibleAt || eligibleAt.getTime() > now().getTime()) {
+            result.skippedRetentionPending += 1;
+            continue;
+          }
+          if (cleanupPolicy.mode === "enforce") {
+            logger.warn(
+              {
+                event: "execution_workspace.retention_mode_unsupported",
+                executionWorkspaceId: workspace.id,
+                projectId: workspace.projectId,
+                mode: cleanupPolicy.mode,
+              },
+              "retention mode enforce is not supported yet; workspace remains a report_only candidate",
+            );
+          }
+          // P3 ships report_only only; enforce is a future board decision.
+          const workspaceMetadata = workspace.metadata as Record<string, unknown> | null;
+          const eligibleAtIso = eligibleAt.toISOString();
+          const alreadyLogged =
+            readRetentionCandidateLoggedForEligibleAt(workspaceMetadata) === eligibleAtIso;
+          const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
+          let estimatedBytes = alreadyLogged
+            ? readRetentionCandidateEstimatedBytes(workspaceMetadata)
+            : null;
+          if (!alreadyLogged) {
+            estimatedBytes = await estimateWorkspaceBytes(workspacePath);
+            const nextMetadata = buildRetentionCandidateLoggedMetadata(
+              workspaceMetadata,
+              eligibleAt,
+              estimatedBytes,
+            );
+            const marked = await db.transaction(async (tx) => {
+              await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+              const rows = await tx
+                .update(executionWorkspaces)
+                .set({ metadata: nextMetadata, updatedAt: new Date() })
+                .where(and(
+                  eq(executionWorkspaces.id, workspace.id),
+                  eq(executionWorkspaces.companyId, workspace.companyId),
+                  inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+                  isNull(executionWorkspaces.closedAt),
+                  eq(executionWorkspaces.cleanupEligibleAt, eligibleAt),
+                ))
+                .returning({ id: executionWorkspaces.id });
+              return rows.length > 0;
+            });
+            if (marked) {
+              await logActivity(db, {
+                companyId: workspace.companyId,
+                actorType: "system",
+                actorId: "workspace_terminality_reaper",
+                action: "execution_workspace.retention_candidate",
+                entityType: "execution_workspace",
+                entityId: workspace.id,
+                details: {
+                  sourceIssueId: workspace.sourceIssueId,
+                  workspacePath,
+                  estimatedBytes,
+                  cleanupEligibleAt: eligibleAtIso,
+                  retentionDays: cleanupPolicy.retentionDays,
+                  mode: cleanupPolicy.mode,
+                },
+              });
+              result.retentionCandidates += 1;
+              result.retentionCandidateEstimatedBytesTotal += estimatedBytes ?? 0;
+              const companySummary = retentionCandidateSummaryByCompany.get(workspace.companyId)
+                ?? { count: 0, estimatedBytesTotal: 0 };
+              companySummary.count += 1;
+              companySummary.estimatedBytesTotal += estimatedBytes ?? 0;
+              retentionCandidateSummaryByCompany.set(workspace.companyId, companySummary);
+            }
+          }
+          continue;
+        }
+
         result.eligible += 1;
         const closedAt = now();
         // Raise the lifecycle generation on archive. The cleanup below captures
@@ -3044,6 +3512,22 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           });
         }
       }
+
+      for (const [companyId, summary] of retentionCandidateSummaryByCompany) {
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "workspace_terminality_reaper",
+          action: "execution_workspace.retention_candidates_summary",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            retentionCandidates: summary.count,
+            estimatedBytesTotal: summary.estimatedBytesTotal,
+          },
+        });
+      }
+
       return result;
       } finally {
         terminalSweepInProgress = false;
