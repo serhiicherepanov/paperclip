@@ -46,7 +46,11 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
-import { parseProjectExecutionWorkspacePolicy, parseWorkspaceCleanupPolicy } from "./execution-workspace-policy.js";
+import {
+  parseProjectExecutionWorkspacePolicy,
+  parseWorkspaceCleanupPolicy,
+  retentionAppliesToWorkspace,
+} from "./execution-workspace-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { logActivity } from "./activity-log.js";
@@ -1501,6 +1505,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const requireGitCloseReadiness = options.requireGitCloseReadiness ?? true;
     let git: ExecutionWorkspaceCloseGitReadiness | null = null;
     let statusInspectionSucceeded = true;
+    // When requireCloseReadiness is false, git inspection is skipped entirely, so
+    // assessDelivery sees git = null and a dirty worktree can still receive
+    // cleanupEligibleAt. That is acceptable in report_only mode because the sweep
+    // re-checks readiness before archive. Before enabling enforce mode, this path
+    // must resume git close-readiness checks so teardown never runs on a dirty tree.
     if (requireGitCloseReadiness) {
       const executionWorkspace = toExecutionWorkspace(workspace);
       const inspection = await inspectGitCloseReadiness(executionWorkspace);
@@ -2993,17 +3002,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             continue;
           }
 
-          if (cleanupPolicy.excludeProjectPrimary && await resolveWorkspaceIsProjectPrimary(workspace)) {
-            result.skippedProjectPrimary += 1;
-            if (workspace.cleanupEligibleAt != null) {
-              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
-              if (cleared) result.clearedIneligible += 1;
+          const isProjectPrimary = cleanupPolicy.excludeProjectPrimary
+            ? await resolveWorkspaceIsProjectPrimary(workspace)
+            : false;
+          if (!retentionAppliesToWorkspace(cleanupPolicy, workspace, { isProjectPrimary })) {
+            if (isProjectPrimary) {
+              result.skippedProjectPrimary += 1;
+            } else {
+              result.skippedScope += 1;
             }
-            continue;
-          }
-
-          if (cleanupPolicy.scope === "isolated_workspace" && workspace.mode !== "isolated_workspace") {
-            result.skippedScope += 1;
             if (workspace.cleanupEligibleAt != null) {
               const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
               if (cleared) result.clearedIneligible += 1;
@@ -3278,7 +3285,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           projectPolicyCache,
         );
         const cleanupPolicy = projectPolicy?.cleanupPolicy ?? null;
-        if (cleanupPolicy?.enabled) {
+        const isProjectPrimary = cleanupPolicy?.excludeProjectPrimary
+          ? await resolveWorkspaceIsProjectPrimary(workspace)
+          : false;
+        if (
+          cleanupPolicy?.enabled
+          && retentionAppliesToWorkspace(cleanupPolicy, workspace, { isProjectPrimary })
+        ) {
           const eligibleAt = workspace.cleanupEligibleAt;
           if (!eligibleAt || eligibleAt.getTime() > now().getTime()) {
             result.skippedRetentionPending += 1;

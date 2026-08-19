@@ -14,12 +14,14 @@ import {
   issueWorkProducts,
   issues,
   projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.ts";
+import { parseWorkspaceCleanupPolicy } from "../services/execution-workspace-policy.ts";
 import { updateProjectSchema } from "@paperclipai/shared";
 
 const execFileAsync = promisify(execFile);
@@ -52,6 +54,7 @@ describe("execution workspace retention reconciler", () => {
     await db.delete(issueWorkProducts);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(companies);
     pullRequestDetailsByKey.clear();
@@ -87,6 +90,7 @@ describe("execution workspace retention reconciler", () => {
     mode?: "isolated_workspace" | "shared_workspace";
     mergedPr?: boolean;
     dirty?: boolean;
+    projectPrimary?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -95,10 +99,16 @@ describe("execution workspace retention reconciler", () => {
     const issuePrefix = `R${companyId.slice(0, 8).toUpperCase()}`;
     const identifier = `${issuePrefix}-1`;
     const repoRoot = await createTempRepo();
-    const worktreePath = path.join(path.dirname(repoRoot), `paperclip-retention-${randomUUID()}`);
-    tempDirs.add(worktreePath);
-    await runGit(repoRoot, ["branch", "feature/retention"]);
-    await runGit(repoRoot, ["worktree", "add", worktreePath, "feature/retention"]);
+    let worktreePath = repoRoot;
+    let projectWorkspaceId: string | null = null;
+    if (options.projectPrimary) {
+      projectWorkspaceId = randomUUID();
+    } else {
+      worktreePath = path.join(path.dirname(repoRoot), `paperclip-retention-${randomUUID()}`);
+      tempDirs.add(worktreePath);
+      await runGit(repoRoot, ["branch", "feature/retention"]);
+      await runGit(repoRoot, ["worktree", "add", worktreePath, "feature/retention"]);
+    }
     await fs.writeFile(path.join(worktreePath, "delivered.txt"), "delivered\n", "utf8");
     await runGit(worktreePath, ["add", "delivered.txt"]);
     await runGit(worktreePath, ["commit", "-m", "Delivered change"]);
@@ -125,20 +135,32 @@ describe("execution workspace retention reconciler", () => {
           }
         : null,
     });
+    if (projectWorkspaceId) {
+      await db.insert(projectWorkspaces).values({
+        id: projectWorkspaceId,
+        companyId,
+        projectId,
+        name: "Primary",
+        sourceType: "git_repo",
+        isPrimary: true,
+        cwd: repoRoot,
+      });
+    }
     await db.insert(executionWorkspaces).values({
       id: executionWorkspaceId,
       companyId,
       projectId,
+      ...(projectWorkspaceId ? { projectWorkspaceId } : {}),
       mode: options.mode ?? "isolated_workspace",
-      strategyType: "git_worktree",
+      strategyType: options.projectPrimary ? "project_primary" : "git_worktree",
       name: identifier,
       status: "active",
       cwd: worktreePath,
       providerRef: worktreePath,
-      providerType: "git_worktree",
+      providerType: options.projectPrimary ? "local_fs" : "git_worktree",
       repoUrl: "https://github.com/paperclipai/paperclip.git",
       baseRef: "main",
-      branchName: "feature/retention",
+      branchName: options.projectPrimary ? "main" : "feature/retention",
     });
     await db.insert(issues).values({
       id: sourceIssueId,
@@ -169,7 +191,7 @@ describe("execution workspace retention reconciler", () => {
       });
       pullRequestDetailsByKey.set(`${companyId}:99001`, {
         state: "merged",
-        headRef: "feature/retention",
+        headRef: options.projectPrimary ? "main" : "feature/retention",
         headSha,
       });
     }
@@ -458,6 +480,57 @@ describe("execution workspace retention reconciler", () => {
     expect(clearedRow?.cleanupEligibleAt).toBeNull();
   });
 
+  it("archives shared_workspace immediately when retention scope is isolated_workspace only", async () => {
+    const seeded = await seedTerminalWorkspace({
+      mode: "shared_workspace",
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        scope: "isolated_workspace",
+        excludeProjectPrimary: true,
+      },
+    });
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ skippedScope: 1, scheduled: 0 });
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep).toMatchObject({ archived: 1, retentionCandidates: 0, skippedRetentionPending: 0 });
+
+    const [row] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(row?.status).toBe("archived");
+  });
+
+  it("archives project-primary workspace immediately when excludeProjectPrimary is true", async () => {
+    const seeded = await seedTerminalWorkspace({
+      mode: "shared_workspace",
+      projectPrimary: true,
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        scope: "isolated_workspace",
+        excludeProjectPrimary: true,
+      },
+    });
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ skippedProjectPrimary: 1, scheduled: 0 });
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep).toMatchObject({ archived: 1, retentionCandidates: 0, skippedRetentionPending: 0 });
+
+    const [row] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(row?.status).toBe("archived");
+  });
+
   it("accepts cleanupPolicy with unknown keys on project update validation", () => {
     const result = updateProjectSchema.safeParse({
       executionWorkspacePolicy: {
@@ -477,5 +550,36 @@ describe("execution workspace retention reconciler", () => {
         legacyUnknownKey: "keep-me",
       });
     }
+  });
+
+  it("coerces string retentionDays on project update validation", () => {
+    const result = updateProjectSchema.safeParse({
+      executionWorkspacePolicy: {
+        enabled: true,
+        cleanupPolicy: {
+          enabled: true,
+          retentionDays: "7",
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.executionWorkspacePolicy?.cleanupPolicy?.retentionDays).toBe(7);
+    }
+  });
+
+  it("strips unknown cleanupPolicy keys at runtime without disabling retention", () => {
+    const parsed = parseWorkspaceCleanupPolicy({
+      enabled: true,
+      retentionDays: 7,
+      mode: "report_only",
+      legacyUnknownKey: "ignored",
+    });
+    expect(parsed).toMatchObject({
+      enabled: true,
+      retentionDays: 7,
+      mode: "report_only",
+    });
+    expect(parsed).not.toHaveProperty("legacyUnknownKey");
   });
 });

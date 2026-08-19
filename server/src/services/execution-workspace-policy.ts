@@ -106,6 +106,21 @@ export function isUnrunnableWorktreeCombo(input: {
 
 const invalidCleanupPolicyWarnedProjectIds = new Set<string>();
 
+export type RetentionWorkspaceScopeInput = {
+  mode: string;
+};
+
+/** Whether an enabled retention policy applies to this workspace (scope + project-primary gate). */
+export function retentionAppliesToWorkspace(
+  cleanupPolicy: WorkspaceCleanupPolicy,
+  workspace: RetentionWorkspaceScopeInput,
+  options: { isProjectPrimary: boolean },
+): boolean {
+  if (cleanupPolicy.excludeProjectPrimary && options.isProjectPrimary) return false;
+  if (cleanupPolicy.scope === "isolated_workspace" && workspace.mode !== "isolated_workspace") return false;
+  return true;
+}
+
 export function parseWorkspaceCleanupPolicy(
   raw: unknown,
   options: { projectId?: string | null } = {},

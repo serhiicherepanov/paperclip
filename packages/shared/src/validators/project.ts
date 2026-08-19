@@ -24,11 +24,20 @@ const workspaceCleanupPolicyFields = {
   requireCloseReadiness: z.boolean().default(true),
 } as const;
 
-/** Strict schema for runtime policy parsing (unknown keys are rejected). */
-export const workspaceCleanupPolicySchema = z.object(workspaceCleanupPolicyFields).strict();
+/** Runtime policy parsing: validate known keys, drop unknown keys, apply defaults. */
+export const workspaceCleanupPolicySchema = z.object(workspaceCleanupPolicyFields).strip();
 
 /** Permissive schema for project create/update requests (preserves unknown keys). */
-export const workspaceCleanupPolicyInputSchema = z.object(workspaceCleanupPolicyFields).passthrough();
+export const workspaceCleanupPolicyInputSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    retentionDays: z.coerce.number().int().min(0).max(365).optional(),
+    mode: z.enum(["report_only", "enforce"]).optional(),
+    scope: z.enum(["isolated_workspace", "all"]).optional(),
+    excludeProjectPrimary: z.boolean().optional(),
+    requireCloseReadiness: z.boolean().optional(),
+  })
+  .passthrough();
 
 export type WorkspaceCleanupPolicy = z.infer<typeof workspaceCleanupPolicySchema>;
 
