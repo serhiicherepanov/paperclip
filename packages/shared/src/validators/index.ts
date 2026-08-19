@@ -378,6 +378,7 @@ export {
   projectExecutionWorkspacePolicySchema,
   projectWorkspaceRuntimeConfigSchema,
   workspaceCleanupPolicySchema,
+  workspaceCleanupPolicyInputSchema,
   type CreateProject,
   type UpdateProject,
   type CreateProjectWorkspace,

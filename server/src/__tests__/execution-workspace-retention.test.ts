@@ -20,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.ts";
+import { updateProjectSchema } from "@paperclipai/shared";
 
 const execFileAsync = promisify(execFile);
 
@@ -358,5 +359,83 @@ describe("execution workspace retention reconciler", () => {
     expect(reanchoredRow?.cleanupEligibleAt?.getTime()).toBe(
       secondTerminal.getTime() + 7 * 86_400_000,
     );
+  });
+
+  it("logs retention_candidate only once across repeated sweeps", async () => {
+    const terminalAnchor = new Date(Date.now() - 8 * 86_400_000);
+    const seeded = await seedTerminalWorkspace({
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+      },
+    });
+    await db
+      .update(issues)
+      .set({ completedAt: terminalAnchor, updatedAt: terminalAnchor })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    await svc.scheduleCleanupEligibility();
+    await svc.sweepTerminalWorkspaces();
+    await svc.sweepTerminalWorkspaces();
+    await svc.sweepTerminalWorkspaces();
+
+    const candidateLogs = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.entityId, seeded.executionWorkspaceId));
+    expect(candidateLogs.filter((row) => row.action === "execution_workspace.retention_candidate")).toHaveLength(1);
+
+    const summaryLogs = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, seeded.companyId));
+    expect(summaryLogs.filter((row) => row.action === "execution_workspace.retention_candidates_summary").length)
+      .toBeGreaterThan(0);
+  });
+
+  it("does not schedule non-terminal workspaces when requireCloseReadiness is false", async () => {
+    const seeded = await seedTerminalWorkspace({
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        requireCloseReadiness: false,
+      },
+    });
+    await db
+      .update(issues)
+      .set({ status: "in_progress", completedAt: null })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ scheduled: 0, skippedNotReady: 1 });
+
+    const [row] = await db
+      .select({ cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(row?.cleanupEligibleAt).toBeNull();
+  });
+
+  it("accepts cleanupPolicy with unknown keys on project update validation", () => {
+    const result = updateProjectSchema.safeParse({
+      executionWorkspacePolicy: {
+        enabled: true,
+        cleanupPolicy: {
+          enabled: true,
+          retentionDays: 7,
+          legacyUnknownKey: "keep-me",
+        },
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.executionWorkspacePolicy?.cleanupPolicy).toMatchObject({
+        enabled: true,
+        retentionDays: 7,
+        legacyUnknownKey: "keep-me",
+      });
+    }
   });
 });

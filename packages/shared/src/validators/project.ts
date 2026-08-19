@@ -15,14 +15,20 @@ const executionWorkspaceStrategySchema = z
   })
   .strict();
 
-export const workspaceCleanupPolicySchema = z.object({
+const workspaceCleanupPolicyFields = {
   enabled: z.boolean().default(false),
   retentionDays: z.number().int().min(0).max(365).default(7),
   mode: z.enum(["report_only", "enforce"]).default("report_only"),
   scope: z.enum(["isolated_workspace", "all"]).default("isolated_workspace"),
   excludeProjectPrimary: z.boolean().default(true),
   requireCloseReadiness: z.boolean().default(true),
-}).strict();
+} as const;
+
+/** Strict schema for runtime policy parsing (unknown keys are rejected). */
+export const workspaceCleanupPolicySchema = z.object(workspaceCleanupPolicyFields).strict();
+
+/** Permissive schema for project create/update requests (preserves unknown keys). */
+export const workspaceCleanupPolicyInputSchema = z.object(workspaceCleanupPolicyFields).passthrough();
 
 export type WorkspaceCleanupPolicy = z.infer<typeof workspaceCleanupPolicySchema>;
 
@@ -39,7 +45,7 @@ export const projectExecutionWorkspacePolicySchema = z
     branchPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     pullRequestPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     runtimePolicy: z.record(z.string(), z.unknown()).optional().nullable(),
-    cleanupPolicy: workspaceCleanupPolicySchema.optional().nullable(),
+    cleanupPolicy: workspaceCleanupPolicyInputSchema.optional().nullable(),
     authorizationPolicy: trustAuthorizationPolicySchema.optional().nullable(),
   })
   .strict();

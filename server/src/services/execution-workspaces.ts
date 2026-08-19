@@ -172,6 +172,16 @@ export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingCon
 // same write that sets the flag, and every clear removes both keys together.
 export const EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY = "reopenPendingConsumptionSince";
 
+// Records the cleanupEligibleAt value for which a retention_candidate activity
+// log was emitted. The terminal reaper compares this to the current
+// cleanupEligibleAt so report_only candidates log once per eligibility anchor.
+export const EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY =
+  "retentionCandidateLoggedForEligibleAt";
+
+// Cached du estimate written alongside the retention_candidate log marker.
+export const EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY =
+  "retentionCandidateEstimatedBytes";
+
 export function metadataHasReopenPendingConsumption(
   metadata: Record<string, unknown> | null | undefined,
 ): boolean {
@@ -214,6 +224,34 @@ export function clearMetadataReopenPendingConsumption(
   delete next[EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY];
   delete next[EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY];
   return next;
+}
+
+function readRetentionCandidateLoggedForEligibleAt(
+  metadata: Record<string, unknown> | null | undefined,
+): string | null {
+  const raw = metadata?.[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY];
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+function readRetentionCandidateEstimatedBytes(
+  metadata: Record<string, unknown> | null | undefined,
+): number | null {
+  const raw = metadata?.[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+}
+
+function buildRetentionCandidateLoggedMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+  eligibleAt: Date,
+  estimatedBytes: number | null,
+): Record<string, unknown> {
+  return {
+    ...(metadata ?? {}),
+    [EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY]: eligibleAt.toISOString(),
+    ...(estimatedBytes != null
+      ? { [EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY]: estimatedBytes }
+      : {}),
+  };
 }
 
 // Acquire the per-workspace, transaction-scoped Postgres advisory lock. Postgres
@@ -1367,6 +1405,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function estimateWorkspaceBytes(workspacePath: string | null): Promise<number | null> {
     if (!workspacePath) return null;
     try {
+      // GNU coreutils `du -sx --bytes`; busybox/macOS builds may not support
+      // these flags and will return null instead of failing the sweep.
       const { stdout } = await execFileAsync("du", ["-sx", "--bytes", workspacePath], {
         timeout: 2_000,
         maxBuffer: 1024 * 1024,
@@ -1436,10 +1476,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
   async function evaluateRetentionReadiness(
     workspace: ExecutionWorkspaceRow,
+    options: { requireGitCloseReadiness?: boolean } = {},
   ): Promise<RetentionReadinessAssessment | null> {
+    const requireGitCloseReadiness = options.requireGitCloseReadiness ?? true;
     const executionWorkspace = toExecutionWorkspace(workspace);
     const { statusInspectionSucceeded, git } = await inspectGitCloseReadiness(executionWorkspace);
-    if (!statusInspectionSucceeded) return null;
+    if (requireGitCloseReadiness && !statusInspectionSucceeded) return null;
     const assessment = await assessDelivery(workspace, git);
     const reopenPending = metadataHasReopenPendingConsumption(
       workspace.metadata as Record<string, unknown> | null,
@@ -2930,12 +2972,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             continue;
           }
 
-          const readiness = cleanupPolicy.requireCloseReadiness
-            ? await evaluateRetentionReadiness(workspace)
-            : await (async () => {
-                const assessment = await assessDelivery(workspace, null);
-                return { ...assessment, statusInspectionSucceeded: true };
-              })();
+          const readiness = await evaluateRetentionReadiness(workspace, {
+            requireGitCloseReadiness: cleanupPolicy.requireCloseReadiness,
+          });
 
           if (!readiness) {
             result.skippedNotReady += 1;
@@ -2998,6 +3037,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           skippedCooldown: 0,
           skippedRetentionPending: 0,
           retentionCandidates: 0,
+          retentionCandidateEstimatedBytesTotal: 0,
           clearedStaleReopenPending: 0,
         };
       }
@@ -3064,9 +3104,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedCooldown: 0,
         skippedRetentionPending: 0,
         retentionCandidates: 0,
+        retentionCandidateEstimatedBytesTotal: 0,
         clearedStaleReopenPending: 0,
       };
       const projectPolicyCache = new Map<string, ReturnType<typeof parseProjectExecutionWorkspacePolicy>>();
+      const retentionCandidateSummaryByCompany = new Map<string, { count: number; estimatedBytesTotal: number }>();
 
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
@@ -3195,26 +3237,74 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             result.skippedRetentionPending += 1;
             continue;
           }
+          if (cleanupPolicy.mode === "enforce") {
+            logger.warn(
+              {
+                event: "execution_workspace.retention_mode_unsupported",
+                executionWorkspaceId: workspace.id,
+                projectId: workspace.projectId,
+                mode: cleanupPolicy.mode,
+              },
+              "retention mode enforce is not supported yet; workspace remains a report_only candidate",
+            );
+          }
           // P3 ships report_only only; enforce is a future board decision.
+          const workspaceMetadata = workspace.metadata as Record<string, unknown> | null;
+          const eligibleAtIso = eligibleAt.toISOString();
+          const alreadyLogged =
+            readRetentionCandidateLoggedForEligibleAt(workspaceMetadata) === eligibleAtIso;
           const workspacePath = readNullableString(workspace.providerRef) ?? readNullableString(workspace.cwd);
-          const estimatedBytes = await estimateWorkspaceBytes(workspacePath);
-          await logActivity(db, {
-            companyId: workspace.companyId,
-            actorType: "system",
-            actorId: "workspace_terminality_reaper",
-            action: "execution_workspace.retention_candidate",
-            entityType: "execution_workspace",
-            entityId: workspace.id,
-            details: {
-              sourceIssueId: workspace.sourceIssueId,
-              workspacePath,
+          let estimatedBytes = alreadyLogged
+            ? readRetentionCandidateEstimatedBytes(workspaceMetadata)
+            : null;
+          if (!alreadyLogged) {
+            estimatedBytes = await estimateWorkspaceBytes(workspacePath);
+            const nextMetadata = buildRetentionCandidateLoggedMetadata(
+              workspaceMetadata,
+              eligibleAt,
               estimatedBytes,
-              cleanupEligibleAt: eligibleAt.toISOString(),
-              retentionDays: cleanupPolicy.retentionDays,
-              mode: cleanupPolicy.mode,
-            },
-          });
+            );
+            const marked = await db.transaction(async (tx) => {
+              await acquireExecutionWorkspaceLifecycleLock(tx, workspace.id);
+              const rows = await tx
+                .update(executionWorkspaces)
+                .set({ metadata: nextMetadata, updatedAt: new Date() })
+                .where(and(
+                  eq(executionWorkspaces.id, workspace.id),
+                  eq(executionWorkspaces.companyId, workspace.companyId),
+                  inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+                  isNull(executionWorkspaces.closedAt),
+                  eq(executionWorkspaces.cleanupEligibleAt, eligibleAt),
+                ))
+                .returning({ id: executionWorkspaces.id });
+              return rows.length > 0;
+            });
+            if (marked) {
+              await logActivity(db, {
+                companyId: workspace.companyId,
+                actorType: "system",
+                actorId: "workspace_terminality_reaper",
+                action: "execution_workspace.retention_candidate",
+                entityType: "execution_workspace",
+                entityId: workspace.id,
+                details: {
+                  sourceIssueId: workspace.sourceIssueId,
+                  workspacePath,
+                  estimatedBytes,
+                  cleanupEligibleAt: eligibleAtIso,
+                  retentionDays: cleanupPolicy.retentionDays,
+                  mode: cleanupPolicy.mode,
+                },
+              });
+            }
+          }
           result.retentionCandidates += 1;
+          result.retentionCandidateEstimatedBytesTotal += estimatedBytes ?? 0;
+          const companySummary = retentionCandidateSummaryByCompany.get(workspace.companyId)
+            ?? { count: 0, estimatedBytesTotal: 0 };
+          companySummary.count += 1;
+          companySummary.estimatedBytesTotal += estimatedBytes ?? 0;
+          retentionCandidateSummaryByCompany.set(workspace.companyId, companySummary);
           continue;
         }
 
@@ -3368,6 +3458,22 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           });
         }
       }
+
+      for (const [companyId, summary] of retentionCandidateSummaryByCompany) {
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "workspace_terminality_reaper",
+          action: "execution_workspace.retention_candidates_summary",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            retentionCandidates: summary.count,
+            estimatedBytesTotal: summary.estimatedBytesTotal,
+          },
+        });
+      }
+
       return result;
       } finally {
         terminalSweepInProgress = false;

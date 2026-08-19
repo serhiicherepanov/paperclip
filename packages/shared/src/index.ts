@@ -1738,6 +1738,7 @@ export {
   type UpdateProjectWorkspace,
   projectExecutionWorkspacePolicySchema,
   workspaceCleanupPolicySchema,
+  workspaceCleanupPolicyInputSchema,
   type WorkspaceCleanupPolicy,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
