@@ -254,6 +254,15 @@ function buildRetentionCandidateLoggedMetadata(
   };
 }
 
+function clearRetentionCandidateLoggedMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const next = { ...(metadata ?? {}) };
+  delete next[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_LOGGED_FOR_ELIGIBLE_AT_KEY];
+  delete next[EXECUTION_WORKSPACE_RETENTION_CANDIDATE_ESTIMATED_BYTES_KEY];
+  return next;
+}
+
 // Acquire the per-workspace, transaction-scoped Postgres advisory lock. Postgres
 // releases the lock when the transaction that holds `tx` commits or rolls back.
 // Both the reopen path and the destructive cleanup path acquire the same lock,
@@ -1421,9 +1430,20 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   async function clearScheduledCleanupEligibleAt(workspaceId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await acquireExecutionWorkspaceLifecycleLock(tx, workspaceId);
+      const existing = await tx
+        .select({ metadata: executionWorkspaces.metadata })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, workspaceId))
+        .then((rows) => rows[0] ?? null);
       const rows = await tx
         .update(executionWorkspaces)
-        .set({ cleanupEligibleAt: null, updatedAt: new Date() })
+        .set({
+          cleanupEligibleAt: null,
+          metadata: clearRetentionCandidateLoggedMetadata(
+            existing?.metadata as Record<string, unknown> | null,
+          ),
+          updatedAt: new Date(),
+        })
         .where(and(
           eq(executionWorkspaces.id, workspaceId),
           inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
@@ -1479,9 +1499,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     options: { requireGitCloseReadiness?: boolean } = {},
   ): Promise<RetentionReadinessAssessment | null> {
     const requireGitCloseReadiness = options.requireGitCloseReadiness ?? true;
-    const executionWorkspace = toExecutionWorkspace(workspace);
-    const { statusInspectionSucceeded, git } = await inspectGitCloseReadiness(executionWorkspace);
-    if (requireGitCloseReadiness && !statusInspectionSucceeded) return null;
+    let git: ExecutionWorkspaceCloseGitReadiness | null = null;
+    let statusInspectionSucceeded = true;
+    if (requireGitCloseReadiness) {
+      const executionWorkspace = toExecutionWorkspace(workspace);
+      const inspection = await inspectGitCloseReadiness(executionWorkspace);
+      statusInspectionSucceeded = inspection.statusInspectionSucceeded;
+      if (!statusInspectionSucceeded) return null;
+      git = inspection.git;
+    }
     const assessment = await assessDelivery(workspace, git);
     const reopenPending = metadataHasReopenPendingConsumption(
       workspace.metadata as Record<string, unknown> | null,
@@ -1494,6 +1520,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ) {
       return null;
     }
+    if (!assessment.cooldownAnchor) return null;
     if (reopenPending) return null;
     if (await workspaceHasActiveRun(workspace)) return null;
     return { ...assessment, statusInspectionSucceeded };
@@ -2959,16 +2986,28 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const cleanupPolicy = projectPolicy?.cleanupPolicy ?? null;
           if (!cleanupPolicy?.enabled) {
             result.skippedNoPolicy += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
             continue;
           }
 
           if (cleanupPolicy.excludeProjectPrimary && await resolveWorkspaceIsProjectPrimary(workspace)) {
             result.skippedProjectPrimary += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
             continue;
           }
 
           if (cleanupPolicy.scope === "isolated_workspace" && workspace.mode !== "isolated_workspace") {
             result.skippedScope += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
             continue;
           }
 
@@ -2985,7 +3024,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             continue;
           }
 
-          const anchor = readiness.cooldownAnchor ?? now();
+          const anchor = readiness.cooldownAnchor;
+          if (!anchor) {
+            result.skippedNotReady += 1;
+            if (workspace.cleanupEligibleAt != null) {
+              const cleared = await clearScheduledCleanupEligibleAt(workspace.id);
+              if (cleared) result.clearedIneligible += 1;
+            }
+            continue;
+          }
           const computedEligibleAt = new Date(
             anchor.getTime() + cleanupPolicy.retentionDays * 86_400_000,
           );
@@ -3296,15 +3343,15 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                   mode: cleanupPolicy.mode,
                 },
               });
+              result.retentionCandidates += 1;
+              result.retentionCandidateEstimatedBytesTotal += estimatedBytes ?? 0;
+              const companySummary = retentionCandidateSummaryByCompany.get(workspace.companyId)
+                ?? { count: 0, estimatedBytesTotal: 0 };
+              companySummary.count += 1;
+              companySummary.estimatedBytesTotal += estimatedBytes ?? 0;
+              retentionCandidateSummaryByCompany.set(workspace.companyId, companySummary);
             }
           }
-          result.retentionCandidates += 1;
-          result.retentionCandidateEstimatedBytesTotal += estimatedBytes ?? 0;
-          const companySummary = retentionCandidateSummaryByCompany.get(workspace.companyId)
-            ?? { count: 0, estimatedBytesTotal: 0 };
-          companySummary.count += 1;
-          companySummary.estimatedBytesTotal += estimatedBytes ?? 0;
-          retentionCandidateSummaryByCompany.set(workspace.companyId, companySummary);
           continue;
         }
 

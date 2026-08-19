@@ -376,9 +376,11 @@ describe("execution workspace retention reconciler", () => {
       .where(eq(issues.id, seeded.sourceIssueId));
 
     await svc.scheduleCleanupEligibility();
-    await svc.sweepTerminalWorkspaces();
-    await svc.sweepTerminalWorkspaces();
-    await svc.sweepTerminalWorkspaces();
+    const firstSweep = await svc.sweepTerminalWorkspaces();
+    const secondSweep = await svc.sweepTerminalWorkspaces();
+    const thirdSweep = await svc.sweepTerminalWorkspaces();
+    expect(firstSweep.retentionCandidates + secondSweep.retentionCandidates + thirdSweep.retentionCandidates)
+      .toBe(1);
 
     const candidateLogs = await db
       .select({ action: activityLog.action })
@@ -416,6 +418,44 @@ describe("execution workspace retention reconciler", () => {
       .from(executionWorkspaces)
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
     expect(row?.cleanupEligibleAt).toBeNull();
+  });
+
+  it("clears stale cleanupEligibleAt when retention policy scope no longer applies", async () => {
+    const terminalAnchor = new Date(Date.now() - 8 * 86_400_000);
+    const seeded = await seedTerminalWorkspace({
+      mode: "isolated_workspace",
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        scope: "isolated_workspace",
+      },
+    });
+    await db
+      .update(issues)
+      .set({ completedAt: terminalAnchor, updatedAt: terminalAnchor })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    await svc.scheduleCleanupEligibility();
+    const [scheduledRow] = await db
+      .select({ cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(scheduledRow?.cleanupEligibleAt).not.toBeNull();
+
+    await db
+      .update(executionWorkspaces)
+      .set({ mode: "shared_workspace" })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ skippedScope: 1, clearedIneligible: 1 });
+
+    const [clearedRow] = await db
+      .select({ cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(clearedRow?.cleanupEligibleAt).toBeNull();
   });
 
   it("accepts cleanupPolicy with unknown keys on project update validation", () => {

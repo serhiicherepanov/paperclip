@@ -1109,6 +1109,9 @@ export async function startServer(): Promise<StartedServer> {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(terminalWorkspaces
         .scheduleCleanupEligibility()
+        .catch((err) => {
+          logger.error({ err }, "workspace retention scheduling failed");
+        })
         .then(() => terminalWorkspaces.sweepTerminalWorkspaces())
         .then((result) => {
           if (result.archived > 0 || result.cleanupFailed > 0) {
