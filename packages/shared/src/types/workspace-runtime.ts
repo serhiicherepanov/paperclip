@@ -1,5 +1,6 @@
 import type { TrustAuthorizationPolicy } from "../trust-policy.js";
 import type { RuntimeExposureStatus } from "./runtime-exposure.js";
+import type { WorkspaceCleanupPolicy } from "../validators/project.js";
 
 export type ExecutionWorkspaceStrategyType =
   | "project_primary"
@@ -173,7 +174,7 @@ export interface ProjectExecutionWorkspacePolicy {
   branchPolicy?: Record<string, unknown> | null;
   pullRequestPolicy?: Record<string, unknown> | null;
   runtimePolicy?: Record<string, unknown> | null;
-  cleanupPolicy?: Record<string, unknown> | null;
+  cleanupPolicy?: WorkspaceCleanupPolicy | null;
   authorizationPolicy?: TrustAuthorizationPolicy | null;
 }
 

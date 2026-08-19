@@ -377,11 +377,13 @@ export {
   updateProjectWorkspaceSchema,
   projectExecutionWorkspacePolicySchema,
   projectWorkspaceRuntimeConfigSchema,
+  workspaceCleanupPolicySchema,
   type CreateProject,
   type UpdateProject,
   type CreateProjectWorkspace,
   type UpdateProjectWorkspace,
   type ProjectExecutionWorkspacePolicy,
+  type WorkspaceCleanupPolicy,
 } from "./project.js";
 
 export {

@@ -15,6 +15,17 @@ const executionWorkspaceStrategySchema = z
   })
   .strict();
 
+export const workspaceCleanupPolicySchema = z.object({
+  enabled: z.boolean().default(false),
+  retentionDays: z.number().int().min(0).max(365).default(7),
+  mode: z.enum(["report_only", "enforce"]).default("report_only"),
+  scope: z.enum(["isolated_workspace", "all"]).default("isolated_workspace"),
+  excludeProjectPrimary: z.boolean().default(true),
+  requireCloseReadiness: z.boolean().default(true),
+}).strict();
+
+export type WorkspaceCleanupPolicy = z.infer<typeof workspaceCleanupPolicySchema>;
+
 export const projectExecutionWorkspacePolicySchema = z
   .object({
     enabled: z.boolean(),
@@ -28,7 +39,7 @@ export const projectExecutionWorkspacePolicySchema = z
     branchPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     pullRequestPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     runtimePolicy: z.record(z.string(), z.unknown()).optional().nullable(),
-    cleanupPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
+    cleanupPolicy: workspaceCleanupPolicySchema.optional().nullable(),
     authorizationPolicy: trustAuthorizationPolicySchema.optional().nullable(),
   })
   .strict();

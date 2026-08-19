@@ -1108,7 +1108,8 @@ export async function startServer(): Promise<StartedServer> {
     const scheduleTerminalWorkspaceSweep = () => {
       if (heartbeatSchedulerStopped) return;
       trackHeartbeatSchedulerWork(terminalWorkspaces
-        .sweepTerminalWorkspaces()
+        .scheduleCleanupEligibility()
+        .then(() => terminalWorkspaces.sweepTerminalWorkspaces())
         .then((result) => {
           if (result.archived > 0 || result.cleanupFailed > 0) {
             logger.info(result, "terminal issue workspace reaper changed workspace state");
@@ -1119,7 +1120,9 @@ export async function startServer(): Promise<StartedServer> {
             + result.skippedNonTerminalTree
             + result.skippedUndelivered
             + result.skippedRace
-            + result.skippedCooldown;
+            + result.skippedCooldown
+            + result.skippedRetentionPending
+            + result.retentionCandidates;
           const nowMs = Date.now();
           if (skipped > 0 && nowMs - lastTerminalWorkspaceSkipLogAt >= terminalWorkspaceSkipLogIntervalMs) {
             lastTerminalWorkspaceSkipLogAt = nowMs;
