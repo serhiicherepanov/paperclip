@@ -442,6 +442,68 @@ describe("execution workspace retention reconciler", () => {
     expect(row?.cleanupEligibleAt).toBeNull();
   });
 
+  it("schedules cleanupEligibleAt for merged terminal workspaces when requireCloseReadiness is false", async () => {
+    const terminalAnchor = new Date(Date.now() - 8 * 86_400_000);
+    const seeded = await seedTerminalWorkspace({
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        requireCloseReadiness: false,
+      },
+    });
+    await db
+      .update(issues)
+      .set({ completedAt: terminalAnchor, updatedAt: terminalAnchor })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ scheduled: 1 });
+
+    const [scheduledRow] = await db
+      .select({ cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt, status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(scheduledRow?.status).toBe("active");
+    expect(scheduledRow?.cleanupEligibleAt).not.toBeNull();
+    expect(scheduledRow!.cleanupEligibleAt!.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("schedules eligibility but sweep skips dirty workspaces when requireCloseReadiness is false", async () => {
+    const terminalAnchor = new Date(Date.now() - 8 * 86_400_000);
+    const seeded = await seedTerminalWorkspace({
+      dirty: true,
+      cleanupPolicy: {
+        enabled: true,
+        retentionDays: 7,
+        mode: "report_only",
+        requireCloseReadiness: false,
+      },
+    });
+    await db
+      .update(issues)
+      .set({ completedAt: terminalAnchor, updatedAt: terminalAnchor })
+      .where(eq(issues.id, seeded.sourceIssueId));
+
+    const schedule = await svc.scheduleCleanupEligibility();
+    expect(schedule).toMatchObject({ scheduled: 1 });
+
+    const [scheduledRow] = await db
+      .select({ cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(scheduledRow?.cleanupEligibleAt).not.toBeNull();
+
+    const sweep = await svc.sweepTerminalWorkspaces();
+    expect(sweep).toMatchObject({ archived: 0, skippedUndelivered: 1, retentionCandidates: 0 });
+
+    const [afterSweep] = await db
+      .select({ status: executionWorkspaces.status })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    expect(afterSweep?.status).toBe("active");
+  });
+
   it("clears stale cleanupEligibleAt when retention policy scope no longer applies", async () => {
     const terminalAnchor = new Date(Date.now() - 8 * 86_400_000);
     const seeded = await seedTerminalWorkspace({

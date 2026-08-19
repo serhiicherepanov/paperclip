@@ -1503,26 +1503,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     options: { requireGitCloseReadiness?: boolean } = {},
   ): Promise<RetentionReadinessAssessment | null> {
     const requireGitCloseReadiness = options.requireGitCloseReadiness ?? true;
-    let git: ExecutionWorkspaceCloseGitReadiness | null = null;
-    let statusInspectionSucceeded = true;
-    // When requireCloseReadiness is false, git inspection is skipped entirely, so
-    // assessDelivery sees git = null and a dirty worktree can still receive
-    // cleanupEligibleAt. That is acceptable in report_only mode because the sweep
-    // re-checks readiness before archive. Before enabling enforce mode, this path
-    // must resume git close-readiness checks so teardown never runs on a dirty tree.
-    if (requireGitCloseReadiness) {
-      const executionWorkspace = toExecutionWorkspace(workspace);
-      const inspection = await inspectGitCloseReadiness(executionWorkspace);
-      statusInspectionSucceeded = inspection.statusInspectionSucceeded;
-      if (!statusInspectionSucceeded) return null;
-      git = inspection.git;
-    }
+    const executionWorkspace = toExecutionWorkspace(workspace);
+    const inspection = await inspectGitCloseReadiness(executionWorkspace);
+    const statusInspectionSucceeded = inspection.statusInspectionSucceeded;
+    if (requireGitCloseReadiness && !statusInspectionSucceeded) return null;
+    const git = inspection.git;
     const assessment = await assessDelivery(workspace, git);
     const reopenPending = metadataHasReopenPendingConsumption(
       workspace.metadata as Record<string, unknown> | null,
     );
     if (!assessment.sourceIssueTerminal || !assessment.subtreeTerminal) return null;
-    if (assessment.workspaceDirty) return null;
+    if (requireGitCloseReadiness && assessment.workspaceDirty) return null;
     if (
       assessment.deliveryState !== "merged_via_pr"
       && assessment.deliveryState !== "merged_by_ancestry"
@@ -3285,12 +3276,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           projectPolicyCache,
         );
         const cleanupPolicy = projectPolicy?.cleanupPolicy ?? null;
-        const isProjectPrimary = cleanupPolicy?.excludeProjectPrimary
-          ? await resolveWorkspaceIsProjectPrimary(workspace)
-          : false;
         if (
           cleanupPolicy?.enabled
-          && retentionAppliesToWorkspace(cleanupPolicy, workspace, { isProjectPrimary })
+          && retentionAppliesToWorkspace(cleanupPolicy, workspace, {
+            isProjectPrimary: cleanupPolicy.excludeProjectPrimary
+              ? await resolveWorkspaceIsProjectPrimary(workspace)
+              : false,
+          })
         ) {
           const eligibleAt = workspace.cleanupEligibleAt;
           if (!eligibleAt || eligibleAt.getTime() > now().getTime()) {
