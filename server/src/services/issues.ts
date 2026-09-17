@@ -88,6 +88,10 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import {
+  findPossibleDuplicateIssuesForCreate,
+  type PossibleDuplicateIssue,
+} from "./issue-duplicate-slug-signal.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -7418,7 +7422,20 @@ export function issueService(db: Db) {
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
-        return withRelations;
+        // Soft, non-blocking duplicate-slug signal (DIG-4556 variant c) — never
+        // fails the create; see issue-duplicate-slug-signal.ts for the query.
+        let possibleDuplicates: PossibleDuplicateIssue[] = [];
+        try {
+          possibleDuplicates = await findPossibleDuplicateIssuesForCreate(tx as unknown as Db, {
+            companyId,
+            parentId: issue.parentId,
+            title: issue.title,
+            excludeIssueId: issue.id,
+          });
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id, companyId }, "failed to compute possible-duplicate-slug signal");
+        }
+        return { ...withRelations, possibleDuplicates };
       });
     },
 
