@@ -8836,6 +8836,9 @@ export function issueRoutes(
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
+    // `issue.possibleDuplicates` (DIG-4556 variant c, from svc.create()) is a
+    // non-terminal, same-root-subtree, same-type-prefix+slug signal — advisory
+    // only, empty when nothing matches, never blocks or replaces this create.
     res.status(201).json({
       ...issue,
       relatedWork: referenceSummary,
