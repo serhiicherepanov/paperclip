@@ -71,6 +71,23 @@ d("heartbeat context_snapshot expression index migration", () => {
     const secretRegistryText = secretRegistryPlan.map((r) => Object.values(r)[0]).join("\n");
     expect(secretRegistryText).toContain("heartbeat_runs_company_secret_registry_created_idx");
 
+    // run-secret-redaction.ts sends company_id/issueId as bind parameters but
+    // must splice the registry key in as SQL text, because a partial index
+    // predicate can only be used by a plan that can prove it holds. A bind
+    // parameter can't be proven, so postgres.js promoting this query to a
+    // generic plan (after 5 executions) would silently drop the index and
+    // fall back to scanning every row for the company — EXPLAIN with plain
+    // literals above can't see this, since literals are provable either way.
+    // EXPLAIN (GENERIC_PLAN) reproduces that generic-plan decision directly.
+    const genericPlan = await sql.unsafe(
+      `EXPLAIN (GENERIC_PLAN) SELECT id FROM heartbeat_runs
+       WHERE company_id = $1
+         AND jsonb_exists(context_snapshot, 'paperclipSecretRedactions')
+         AND (context_snapshot ->> 'issueId' = $2 OR context_snapshot -> 'paperclipIssue' ->> 'id' = $2)`,
+    );
+    const genericText = genericPlan.map((r) => Object.values(r)[0]).join("\n");
+    expect(genericText).toContain("heartbeat_runs_company_secret_registry_created_idx");
+
     // Idempotency: re-running the migration statements against an already
     // migrated database must be a no-op, not an error.
     for (const migration of [

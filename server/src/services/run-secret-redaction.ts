@@ -7,6 +7,15 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 
 const REGISTRY_KEY = "paperclipSecretRedactions";
+// heartbeat_runs_company_secret_registry_created_idx is a partial index on
+// this exact jsonb_exists(...) predicate. Postgres can only use a partial
+// index when it can prove the predicate from the query as planned; a bind
+// parameter can't be proven, so once postgres.js promotes the query past its
+// first 5 executions to a generic plan, the planner drops the index and
+// falls back to scanning every row for the company. Splicing the key in as
+// SQL text (a compile-time constant, not user input) keeps the predicate a
+// literal under every plan type.
+const REGISTRY_KEY_SQL_LITERAL = sql.raw(`'${REGISTRY_KEY}'`);
 
 type RegistryEntry = {
   fingerprintSha256: string;
@@ -85,7 +94,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
         // to rows that carry it changes nothing in the result; it does let the
         // planner use a partial index instead of detoasting context_snapshot on
         // every row (heartbeat_runs_company_secret_registry_created_idx).
-        sql`jsonb_exists(${heartbeatRuns.contextSnapshot}, ${REGISTRY_KEY})`,
+        sql`jsonb_exists(${heartbeatRuns.contextSnapshot}, ${REGISTRY_KEY_SQL_LITERAL})`,
         or(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
