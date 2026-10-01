@@ -28,6 +28,7 @@ d("heartbeat context_snapshot expression index migration", () => {
     expect(names).toContain("heartbeat_runs_company_ctx_task_created_idx");
     expect(names).toContain("heartbeat_runs_company_ctx_taskkey_created_idx");
     expect(names).toContain("agent_wakeup_requests_company_payload_issue_idx");
+    expect(names).toContain("heartbeat_runs_company_secret_registry_created_idx");
 
     await sql.unsafe("SET enable_seqscan = off");
     const plan = await sql.unsafe(
@@ -58,11 +59,24 @@ d("heartbeat context_snapshot expression index migration", () => {
     const wakeText = wakePlan.map((r) => Object.values(r)[0]).join("\n");
     expect(wakeText).toContain("agent_wakeup_requests_company_payload_issue_idx");
 
+    // valuesForIssue (run-secret-redaction.ts) ORs issueId and paperclipIssue.id;
+    // the registry-key predicate must match this partial index exactly so the
+    // planner skips detoasting context_snapshot on rows without the key.
+    const secretRegistryPlan = await sql.unsafe(
+      `EXPLAIN SELECT id FROM heartbeat_runs
+       WHERE company_id = '00000000-0000-0000-0000-000000000001'
+         AND jsonb_exists(context_snapshot, 'paperclipSecretRedactions')
+         AND (context_snapshot ->> 'issueId' = 'x' OR context_snapshot -> 'paperclipIssue' ->> 'id' = 'x')`,
+    );
+    const secretRegistryText = secretRegistryPlan.map((r) => Object.values(r)[0]).join("\n");
+    expect(secretRegistryText).toContain("heartbeat_runs_company_secret_registry_created_idx");
+
     // Idempotency: re-running the migration statements against an already
     // migrated database must be a no-op, not an error.
     for (const migration of [
       "./migrations/0209_heartbeat_context_snapshot_indexes.sql",
       "./migrations/0210_heartbeat_context_taskkey_index.sql",
+      "./migrations/0234_heartbeat_secret_registry_partial_index.sql",
     ]) {
       const migrationSql = await readFile(
         fileURLToPath(new URL(migration, import.meta.url)),

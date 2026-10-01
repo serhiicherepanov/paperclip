@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_secret_registry_created_idx" ON "heartbeat_runs" USING btree ("company_id", "created_at" DESC) WHERE (jsonb_exists("context_snapshot", 'paperclipSecretRedactions'));

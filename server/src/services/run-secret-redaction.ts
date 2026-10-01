@@ -81,6 +81,11 @@ export function createRunSecretRedactionRegistry(db: Db) {
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
+        // registryEntries() returns [] for any row without this key, so narrowing
+        // to rows that carry it changes nothing in the result; it does let the
+        // planner use a partial index instead of detoasting context_snapshot on
+        // every row (heartbeat_runs_company_secret_registry_created_idx).
+        sql`jsonb_exists(${heartbeatRuns.contextSnapshot}, ${REGISTRY_KEY})`,
         or(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
           sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
